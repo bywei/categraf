@@ -279,3 +279,129 @@ histogram http_latency buckets 1, 2, 4, 8
 ![timestamp](https://cdn.jsdelivr.net/gh/flashcatcloud/categraf@main/inputs/mtail/timestamp.png)
 如果不带 `override_timezone=Asia/Shanghai`, 则默认将`Aug 22 15:34:32` 当做UTC时间，转换为timestamp。 这样再转换为本地时间时，会多了8个小时, 如图。
 ![timestamp](https://cdn.jsdelivr.net/gh/flashcatcloud/categraf@main/inputs/mtail/timezone.png)
+
+
+---
+
+## 变更记录：日志行预处理功能（内存优化）
+
+### 问题背景
+
+在生产环境中，使用 mtail 插件监控大量 JSON 格式的应用日志时，categraf 进程出现持续性内存溢出（OOM），即使已在 mtail 程序中配置了 `limit 10000` 和 `del ... after 24h` 仍无法解决。
+
+典型场景特征：
+- 日志为大体积 JSON 行（单行 30KB~50KB+），但 mtail 程序仅需其中少数几个字段
+- 日志文件按天滚动，glob 模式匹配到大量历史文件（200+）
+- 日志产生频率高（每秒数百行）
+
+### 根因分析
+
+内存溢出由多个因素叠加导致：
+
+**1. 指标基数爆炸**
+- `limit 10000` 在源码中未在插入时强制执行（`GetDatum()` 中标注 `// TODO Check m.Limit`），仅在 GC 时检查
+- `del after 24h` 的过期时间戳在每次指标更新时被刷新，活跃指标永不过期
+- 高基数标签（如 `responseMsg`）导致指标时间序列笛卡尔积爆炸
+- histogram 类型每个标签组合产生 9 条时间序列（buckets + sum + count）
+
+**2. 大行日志的内存放大**
+- 原始数据流：文件读取（128KB buffer）→ 按 `\n` 切行 → `string()` 转换 → channel 传递 → 正则匹配
+- 每行 50KB 的 JSON 日志在 `string()` 转换时分配完整的 Go string 对象
+- Go 正则 `FindStringSubmatch` 的捕获组引用原始大字符串，阻止 GC 回收
+- 200 个文件 × 每秒 10 行 × 50KB = 约 100MB/s 的原始数据吞吐
+
+**3. 文件资源累积**
+- glob 模式匹配所有历史日志文件，每个文件占用一个 goroutine + 文件描述符
+- 过期文件清理依赖 `staleTimer`（24h 超时），期间资源持续占用
+
+### 修复方案
+
+新增**日志行字节级预处理**功能，在日志行从文件读取后、转换为 Go string 之前，在原始 `[]byte` 上进行过滤和裁剪，从根本上避免大字符串的内存分配。
+
+#### 核心思路
+
+```
+原始流程：文件 → 128KB buffer → 按\n切行 → string(50KB) → channel → 正则匹配
+优化流程：文件 → 128KB buffer → 按\n切行 → LineFilter([]byte) → string(200B) → channel → 正则匹配
+```
+
+一行 50KB 的 JSON 日志，如果只需要 `hubsCode`、`methodName`、`responseCode` 等字段，经过字节级过滤后缩减为几百字节，`string()` 转换仅分配这几百字节，内存节省 99%+。
+
+#### 配置方式
+
+在 `mtail.toml` 的 instance 中添加：
+
+```toml
+[[instances]]
+progs = "/path/to/prog"
+logs = ["/path/to/*.log"]
+
+# JSON 字段提取：仅保留指定字段，丢弃其余内容
+# 适用于 JSON 格式的日志行，非 JSON 行不受影响原样传递
+json_extract_fields = ["hubsCode", "methodName", "responseCode", "responseMsg", "status", "costTime", "partnerId"]
+
+# 行长度限制：截断超过指定字节数的行
+# 作为安全兜底，防止异常超长行消耗过多内存
+max_line_length = 4096
+```
+
+#### 配置说明
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `json_extract_fields` | `[]string` | 空（不启用） | 从 JSON 日志行中仅提取指定字段名，重组为精简 JSON。非 JSON 行原样传递。字段不存在时静默跳过，不报错。 |
+| `max_line_length` | `int` | 0（不启用） | 截断超过此字节数的行。设为 0 或不配置则不截断。 |
+
+两个参数可以单独使用，也可以组合使用。组合使用时先执行 JSON 字段提取，再执行长度截断。
+
+#### 行为细节
+
+- `json_extract_fields` 配置的字段在 JSON 中不存在 → 跳过该字段，不报错
+- 所有配置字段都不存在 → 返回原始行原样传递
+- 日志行不是 JSON 格式（不以 `{` 开头）→ 原样传递，不影响非 JSON 日志
+- 对 socket/pipe 类型的日志源，通过 Runtime 级别的 `LinePreprocessor` 提供同等功能（string 级别过滤，作为后备）
+
+### 变更文件清单
+
+| 文件路径 | 变更类型 | 说明 |
+|----------|----------|------|
+| `inputs/mtail/internal/tailer/logstream/linefilter.go` | 新增 | 字节级 `LineFilter` 实现：`NewJSONBytesFieldExtractor`、`NewMaxLineLengthBytesFilter`、`ChainLineFilters` |
+| `inputs/mtail/internal/tailer/logstream/reader.go` | 修改 | `LineReader` 增加 `filter` 字段和 `SetFilter()` 方法；`send()` 和 `Finish()` 在 `string()` 转换前应用 filter |
+| `inputs/mtail/internal/tailer/logstream/filestream.go` | 修改 | `fileStream` 增加 `filter` 字段；`newFileStream()` 接受 `LineFilter` 参数并传递给 `LineReader` |
+| `inputs/mtail/internal/tailer/logstream/logstream.go` | 修改 | `New()` 函数签名增加 `filter LineFilter` 参数，传递给 `newFileStream()` |
+| `inputs/mtail/internal/tailer/tail.go` | 修改 | `Tailer` 增加 `filter` 字段；新增 `SetLineFilter()` Option；`TailPath()` 将 filter 传递给 `logstream.New()` |
+| `inputs/mtail/internal/mtail/options.go` | 修改 | 新增 `SetLineFilter()` Server Option，将 `LineFilter` 传递给 Tailer |
+| `inputs/mtail/internal/runtime/linepreprocessor.go` | 新增 | Runtime 级别的 `LinePreprocessor`（string 级别过滤，作为非文件流的后备方案） |
+| `inputs/mtail/internal/runtime/runtime.go` | 修改 | 消费循环中集成 `linePreprocessor`，在分发给 VM 前对日志行进行预处理 |
+| `inputs/mtail/internal/runtime/options.go` | 修改 | 新增 `SetLinePreprocessor()` Runtime Option |
+| `inputs/mtail/mtail.go` | 修改 | `Instance` 结构体增加 `json_extract_fields` 和 `max_line_length` 配置项；`Init()` 中构建字节级 `LineFilter` 和 Runtime 级 `LinePreprocessor` 并注入 |
+
+### 数据流架构
+
+```
+mtail.toml 配置
+    │
+    ▼
+Instance.Init()
+    ├── 构建 LineFilter (字节级) ──→ mtail.SetLineFilter Option
+    │                                    │
+    │                                    ▼
+    │                              Tailer.filter
+    │                                    │
+    │                                    ▼
+    │                          logstream.New(... filter)
+    │                                    │
+    │                                    ▼
+    │                          newFileStream(... filter)
+    │                                    │
+    │                                    ▼
+    │                          LineReader.SetFilter(filter)
+    │                                    │
+    │                                    ▼
+    │                          send()/Finish() 中在 string() 前过滤 ← 核心优化点
+    │
+    └── 构建 LinePreprocessor (string级) ──→ Runtime.linePreprocessor
+                                                │
+                                                ▼
+                                        消费循环中对 LogLine.Line 过滤（后备方案）
+```

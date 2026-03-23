@@ -258,8 +258,9 @@ type Runtime struct {
 	dumpBytecode         bool           // Instructs the loader to dump to stdout the compiled program after compilation.
 	syslogUseCurrentYear bool           // Instructs the VM to overwrite zero years with the current year in a strptime instruction.
 	omitMetricSource     bool
-	logRuntimeErrors     bool // Instruct the VM to emit runtime errors to the log.
-	trace                bool // Trace execution of each VM.
+	logRuntimeErrors     bool             // Instruct the VM to emit runtime errors to the log.
+	trace                bool             // Trace execution of each VM.
+	linePreprocessor     LinePreprocessor // Optional preprocessor to transform log lines before VM dispatch.
 
 	signalQuit chan struct{} // When closed stops the signal handler goroutine.
 }
@@ -309,6 +310,13 @@ func New(lines <-chan *logline.LogLine, wg *sync.WaitGroup, programPath string, 
 		<-initDone
 		for line := range lines {
 			LineCount.Add(1)
+			// Apply line preprocessor if configured (e.g. JSON field extraction, line truncation)
+			if r.linePreprocessor != nil {
+				line = preprocessLogLine(line, r.linePreprocessor)
+				if line == nil {
+					continue
+				}
+			}
 			r.handleMu.RLock()
 			for prog := range r.handles {
 				r.handles[prog].lines <- line

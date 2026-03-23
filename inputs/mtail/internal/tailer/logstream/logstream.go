@@ -60,8 +60,9 @@ const (
 // New creates a LogStream from the file object located at the absolute path
 // `pathname`.  The LogStream will watch `ctx` for a cancellation signal, and
 // notify the `wg` when it is Done.  `oneShot` is used for testing and only
-// works for regular files that can be seeked.
-func New(ctx context.Context, wg *sync.WaitGroup, waker waker.Waker, pathname string, oneShot OneShotMode) (LogStream, error) {
+// works for regular files that can be seeked.  `filter` is an optional
+// byte-level line filter applied before string conversion to reduce memory.
+func New(ctx context.Context, wg *sync.WaitGroup, waker waker.Waker, pathname string, oneShot OneShotMode, filter LineFilter) (LogStream, error) {
 	if wg == nil {
 		return nil, ErrNeedsWaitgroup
 	}
@@ -101,7 +102,7 @@ func New(ctx context.Context, wg *sync.WaitGroup, waker waker.Waker, pathname st
 	}
 	switch m := fi.Mode(); {
 	case m.IsRegular():
-		return newFileStream(ctx, wg, waker, path, fi, oneShot)
+		return newFileStream(ctx, wg, waker, path, fi, oneShot, filter)
 	case m&os.ModeType == os.ModeNamedPipe:
 		return newFifoStream(ctx, wg, waker, path, fi)
 	// TODO(jaq): in order to listen on an existing socket filepath, we must unlink and recreate it

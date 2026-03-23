@@ -14,6 +14,8 @@ import (
 	"flashcat.cloud/categraf/inputs"
 	"flashcat.cloud/categraf/inputs/mtail/internal/metrics"
 	"flashcat.cloud/categraf/inputs/mtail/internal/mtail"
+	"flashcat.cloud/categraf/inputs/mtail/internal/runtime"
+	"flashcat.cloud/categraf/inputs/mtail/internal/tailer/logstream"
 	"flashcat.cloud/categraf/inputs/mtail/internal/waker"
 	util "flashcat.cloud/categraf/pkg/metrics"
 	"flashcat.cloud/categraf/types"
@@ -52,6 +54,11 @@ type Instance struct {
 	sysLogUseCurrentYear bool   `toml:"-"`
 	LogRuntimeErrors     string `toml:"vm_logs_runtime_errors"` // true
 	logRuntimeErrors     bool   `toml:"-"`
+
+	// Line preprocessing options to reduce memory usage
+	JSONExtractFields []string `toml:"json_extract_fields"` // Extract only these fields from JSON log lines
+	MaxLineLength     int      `toml:"max_line_length"`     // Truncate lines exceeding this length (bytes)
+
 	//
 	ctx    context.Context    `toml:"-"`
 	cancel context.CancelFunc `toml:"-"`
@@ -105,6 +112,33 @@ func (ins *Instance) Init() error {
 		mtail.MaxRegexpLength(ins.MaxRegexpLen),
 		mtail.MaxRecursionDepth(ins.MaxRecursionDepth),
 		mtail.LogRuntimeErrors,
+	}
+
+	// Build byte-level line filter for logstream reader (applied BEFORE string conversion).
+	// This is the primary memory optimization: large JSON lines are filtered at the byte
+	// level so the full original string is never allocated.
+	var byteFilters []logstream.LineFilter
+	if len(ins.JSONExtractFields) > 0 {
+		byteFilters = append(byteFilters, logstream.NewJSONBytesFieldExtractor(ins.JSONExtractFields))
+	}
+	if ins.MaxLineLength > 0 {
+		byteFilters = append(byteFilters, logstream.NewMaxLineLengthBytesFilter(ins.MaxLineLength))
+	}
+	if bf := logstream.ChainLineFilters(byteFilters...); bf != nil {
+		opts = append(opts, mtail.SetLineFilter(bf))
+	}
+
+	// Also build runtime-level preprocessor as a fallback for non-file streams
+	// (sockets, pipes) where the byte-level filter is not applied.
+	var preprocessors []runtime.LinePreprocessor
+	if len(ins.JSONExtractFields) > 0 {
+		preprocessors = append(preprocessors, runtime.NewJSONFieldExtractor(ins.JSONExtractFields))
+	}
+	if ins.MaxLineLength > 0 {
+		preprocessors = append(preprocessors, runtime.NewMaxLineLengthTrimmer(ins.MaxLineLength))
+	}
+	if p := runtime.ChainPreprocessors(preprocessors...); p != nil {
+		opts = append(opts, mtail.SetLinePreprocessor(p))
 	}
 	if ins.cancel != nil {
 		ins.cancel()

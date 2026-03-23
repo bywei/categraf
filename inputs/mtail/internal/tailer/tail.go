@@ -48,6 +48,8 @@ type Tailer struct {
 	logstreamsMu       sync.RWMutex                   // protects `logstreams`.
 	logstreams         map[string]logstream.LogStream // Map absolte pathname to logstream reading that pathname.
 
+	filter logstream.LineFilter // optional byte-level line filter for logstreams
+
 	initDone chan struct{}
 }
 
@@ -107,6 +109,20 @@ type logstreamPollWaker struct {
 
 func (opt logstreamPollWaker) apply(t *Tailer) error {
 	t.logstreamPollWaker = opt.Waker
+	return nil
+}
+
+// SetLineFilter sets a byte-level line filter for all logstreams created by this Tailer.
+func SetLineFilter(f logstream.LineFilter) Option {
+	return &setLineFilter{f}
+}
+
+type setLineFilter struct {
+	f logstream.LineFilter
+}
+
+func (opt *setLineFilter) apply(t *Tailer) error {
+	t.filter = opt.f
 	return nil
 }
 
@@ -260,7 +276,7 @@ func (t *Tailer) TailPath(pathname string) error {
 		// glog.V(2).Infof("already got a logstream on %q", pathname)
 		return nil
 	}
-	l, err := logstream.New(t.ctx, &t.wg, t.logstreamPollWaker, pathname, t.oneShot)
+	l, err := logstream.New(t.ctx, &t.wg, t.logstreamPollWaker, pathname, t.oneShot, t.filter)
 	if err != nil {
 		return err
 	}

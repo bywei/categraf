@@ -13,6 +13,7 @@ import (
 	"flashcat.cloud/categraf/inputs/mtail/internal/exporter"
 	"flashcat.cloud/categraf/inputs/mtail/internal/runtime"
 	"flashcat.cloud/categraf/inputs/mtail/internal/tailer"
+	"flashcat.cloud/categraf/inputs/mtail/internal/tailer/logstream"
 	"flashcat.cloud/categraf/inputs/mtail/internal/waker"
 )
 
@@ -275,5 +276,35 @@ type MaxRecursionDepth int
 
 func (opt MaxRecursionDepth) apply(m *Server) error {
 	m.rOpts = append(m.rOpts, runtime.MaxRecursionDepth(int(opt)))
+	return nil
+}
+
+// SetLinePreprocessor sets a line preprocessor to transform log lines before VM dispatch.
+func SetLinePreprocessor(p runtime.LinePreprocessor) Option {
+	return &setLinePreprocessor{p}
+}
+
+type setLinePreprocessor struct {
+	p runtime.LinePreprocessor
+}
+
+func (opt *setLinePreprocessor) apply(m *Server) error {
+	m.rOpts = append(m.rOpts, runtime.SetLinePreprocessor(opt.p))
+	return nil
+}
+
+// SetLineFilter sets a byte-level line filter applied in the logstream reader
+// BEFORE string conversion. This is the most memory-efficient approach because
+// the full original line is never allocated as a Go string.
+func SetLineFilter(f logstream.LineFilter) Option {
+	return &setLineFilter{f}
+}
+
+type setLineFilter struct {
+	f logstream.LineFilter
+}
+
+func (opt *setLineFilter) apply(m *Server) error {
+	m.tOpts = append(m.tOpts, tailer.SetLineFilter(opt.f))
 	return nil
 }

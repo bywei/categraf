@@ -23,6 +23,7 @@ type LineReader struct {
 	f          io.Reader               // not owned
 	cancel     context.CancelFunc
 	staleTimer *time.Timer // call CancelFunc if no read in 24h
+	filter     LineFilter  // optional filter applied to raw bytes before string conversion
 
 	size int
 	buf  []byte
@@ -39,6 +40,11 @@ func NewLineReader(sourcename string, lines chan<- *logline.LogLine, f io.Reader
 		size:       size,
 		buf:        make([]byte, 0, size),
 	}
+}
+
+// SetFilter sets a LineFilter to transform raw line bytes before string conversion.
+func (lr *LineReader) SetFilter(f LineFilter) {
+	lr.filter = f
 }
 
 // ReadAndSend reads bytes from f, attempts to find line endings in the bytes read, and sends them to the lines channel.  It manages the read buffer size to make sure we can always read size bytes.
@@ -87,7 +93,20 @@ func (lr *LineReader) send(ctx context.Context) bool {
 		skip = 2
 	}
 
-	line := string(lr.buf[lr.off:end])
+	// Apply byte-level filter BEFORE string conversion to avoid allocating the
+	// full original line as a Go string. This is the key memory optimization:
+	// a 50KB JSON line can be reduced to a few hundred bytes at the byte level,
+	// so the string() call only allocates the smaller filtered result.
+	raw := lr.buf[lr.off:end]
+	if lr.filter != nil {
+		raw = lr.filter(raw)
+		if raw == nil {
+			lr.off = end + skip
+			return true
+		}
+	}
+
+	line := string(raw)
 	logLines.Add(lr.sourcename, 1)
 	lr.lines <- logline.New(ctx, lr.sourcename, line)
 	lr.off = end + skip // move past delim
@@ -97,7 +116,18 @@ func (lr *LineReader) send(ctx context.Context) bool {
 // Finish sends the current accumulated line to the end of the buffer, despite
 // there being no closing newline.
 func (lr *LineReader) Finish(ctx context.Context) {
-	line := string(lr.buf[lr.off:])
+	raw := lr.buf[lr.off:]
+	if len(raw) == 0 {
+		return
+	}
+	// Apply byte-level filter before string conversion, same as send().
+	if lr.filter != nil {
+		raw = lr.filter(raw)
+		if raw == nil {
+			return
+		}
+	}
+	line := string(raw)
 	if len(line) == 0 {
 		return
 	}

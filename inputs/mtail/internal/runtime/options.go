@@ -124,3 +124,13 @@ func TraceExecution() Option {
 		return nil
 	}
 }
+
+// SetLinePreprocessor sets a line preprocessor function that transforms log lines
+// before they are dispatched to the VMs. This can be used to extract specific JSON
+// fields or truncate long lines to reduce memory usage.
+func SetLinePreprocessor(p LinePreprocessor) Option {
+	return func(r *Runtime) error {
+		r.linePreprocessor = p
+		return nil
+	}
+}

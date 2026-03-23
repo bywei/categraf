@@ -38,14 +38,16 @@ type fileStream struct {
 	cancel context.CancelFunc
 
 	pathname string // Given name for the underlying file on the filesystem
+	filter   LineFilter // optional byte-level line filter
 }
 
 // newFileStream creates a new log stream from a regular file.
-func newFileStream(ctx context.Context, wg *sync.WaitGroup, waker waker.Waker, pathname string, fi os.FileInfo, oneShot OneShotMode) (LogStream, error) {
+func newFileStream(ctx context.Context, wg *sync.WaitGroup, waker waker.Waker, pathname string, fi os.FileInfo, oneShot OneShotMode, filter LineFilter) (LogStream, error) {
 	ctx, cancel := context.WithCancel(ctx)
 	fs := &fileStream{
 		cancel:   cancel,
 		pathname: pathname,
+		filter:   filter,
 		streamBase: streamBase{
 			sourcename: pathname,
 			lines:      make(chan *logline.LogLine),
@@ -82,6 +84,9 @@ func (fs *fileStream) stream(ctx context.Context, wg *sync.WaitGroup, waker wake
 	}
 
 	lr := NewLineReader(fs.sourcename, fs.lines, fd, defaultReadBufferSize, fs.cancel)
+	if fs.filter != nil {
+		lr.SetFilter(fs.filter)
+	}
 
 	started := make(chan struct{})
 	var total int
